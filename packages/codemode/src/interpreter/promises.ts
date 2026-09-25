@@ -16,12 +16,18 @@ const capability = <R>(ctx: Interpreter<R>, name: string, settle: (value: Value)
     return undefined
   })
 
+// Unhandled rejections past the first hundred are only counted, and each reported message is cut, so a rejection loop
+// cannot grow the report without bound.
+const MAX_REJECTION_DIAGNOSTICS = 100
+const MAX_DIAGNOSTIC_MESSAGE_LENGTH = 4096
+
 // Observation only controls rejection reporting; program completion interrupts all promise work.
 export class Pending<R> {
   private readonly active = new Set<PromiseObj>()
   private readonly ids = new WeakMap<PromiseObj, number>()
   private readonly observed = new WeakSet<PromiseObj>()
   private readonly failures = new Map<number, Diagnostic>()
+  private readonly droppedFailures = new Set<number>()
   private nextID = 0
 
   constructor(
@@ -60,10 +66,17 @@ export class Pending<R> {
             this.ids.delete(promise)
             return
           }
+          if (this.failures.size >= MAX_REJECTION_DIAGNOSTICS) {
+            this.droppedFailures.add(id)
+            return
+          }
           const failure = normalizeError(Cause.squash(exit.cause))
           this.failures.set(id, {
             ...failure,
-            message: `Unhandled rejection from an un-awaited promise: ${failure.message}`,
+            message: `Unhandled rejection from an un-awaited promise: ${failure.message}`.slice(
+              0,
+              MAX_DIAGNOSTIC_MESSAGE_LENGTH,
+            ),
           })
         })
         return promise
@@ -76,7 +89,9 @@ export class Pending<R> {
     this.observed.add(promise)
     const id = this.ids.get(promise)
     this.ids.delete(promise)
-    if (id !== undefined) this.failures.delete(id)
+    if (id === undefined) return
+    this.failures.delete(id)
+    this.droppedFailures.delete(id)
   }
 
   await(promise: PromiseObj): Effect.Effect<Exit.Exit<Value, unknown>> {
@@ -88,7 +103,15 @@ export class Pending<R> {
   }
 
   diagnostics(): Array<Diagnostic> {
-    return [...this.failures].sort(([left], [right]) => left - right).map(([, failure]) => failure)
+    const retained = [...this.failures].sort(([left], [right]) => left - right).map(([, failure]) => failure)
+    if (this.droppedFailures.size === 0) return retained
+    return [
+      ...retained,
+      {
+        kind: "ExecutionFailure",
+        message: `${this.droppedFailures.size} more un-awaited promises rejected; only the first ${MAX_REJECTION_DIAGNOSTICS} are reported.`,
+      },
+    ]
   }
 
   // Re-check because a straggler can create promises before its interruption lands.
@@ -116,6 +139,8 @@ export const resolvePromiseValue = <R>(
   const then = get(value, "then")
   if (typeofValue(then) !== "function") return Effect.succeed(value)
 
+  // The next thenable resolves through a tail flatMap, not a nested yield*, so a chain that never ends runs in
+  // constant memory, as in JS.
   return Effect.gen(function* () {
     // Promise resolution invokes a thenable's method in a later job.
     yield* Effect.yieldNow
@@ -127,8 +152,8 @@ export const resolvePromiseValue = <R>(
       if (Cause.hasInterruptsOnly(executed.cause)) return yield* Effect.failCause(executed.cause)
       Deferred.doneUnsafe(deferred, Exit.fail(Cause.squash(executed.cause)))
     }
-    return yield* resolvePromiseValue(ctx, yield* Deferred.await(deferred), own)
-  })
+    return yield* Deferred.await(deferred)
+  }).pipe(Effect.flatMap((next) => resolvePromiseValue(ctx, next, own)))
 }
 
 export const resolvePromise = <R>(ctx: Interpreter<R>, value: Value): Effect.Effect<PromiseObj, never, R> => {

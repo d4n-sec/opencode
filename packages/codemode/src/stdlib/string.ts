@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { constructor, fn, type Impl, type Method, methods } from "../interpreter/native.js"
-import { checkArrayLength, checkStringLength } from "../interpreter/limits.js"
+import { checkArrayLength, checkStringLength, MAX_STRING_LENGTH } from "../interpreter/limits.js"
 import { invalidData, IteratorSymbol, rangeError, typeError } from "../interpreter/model.js"
 import {
   define,
@@ -34,6 +34,35 @@ const requireDataArgument = (name: string, index: number, arg: Value): Value => 
     throw invalidData(`String.${name} expects argument ${index + 1} to be a data value.`)
   }
   return arg
+}
+
+// The host builds a replaced string in one synchronous step, so bound its length first. Each match adds at most the
+// replacement plus a whole subject per prefix/suffix token; every other `$` token expands to matched text, which sums
+// to at most one subject across all matches. Matches are only counted when the bound for "every position" is too big.
+const checkReplacementLength = (subject: string, replacement: string, countMatches: () => number): void => {
+  const tokens = (token: string) => replacement.split(token).length - 1
+  const perMatch = replacement.length + (tokens("$`") + tokens("$'")) * subject.length
+  const bound = (matches: number) => subject.length + matches * perMatch + tokens("$") * subject.length
+  if (bound(subject.length + 1) > MAX_STRING_LENGTH) checkStringLength(bound(countMatches()))
+}
+
+const countOccurrences = (subject: string, needle: string): number => {
+  if (needle === "") return subject.length + 1
+  let count = 0
+  for (let index = subject.indexOf(needle); index !== -1; index = subject.indexOf(needle, index + needle.length)) {
+    count += 1
+  }
+  return count
+}
+
+const countMatches = (subject: string, pattern: RegExp): number => {
+  const probe = new RegExp(pattern.source, pattern.flags)
+  let count = 0
+  for (let match = probe.exec(subject); match !== null; match = probe.exec(subject)) {
+    count += 1
+    if (match[0] === "") probe.lastIndex += 1
+  }
+  return count
 }
 
 const replaceAllNeedsGlobal = (pattern: RegExp) => {
@@ -204,14 +233,16 @@ export const stringGlobal = <R>(ctx: Interpreter<R>) => {
             )
           }
           const primitives = [search, replacement]
+          const text = str(name, primitives, 1)
           if (pattern instanceof RegExpObj) {
             const regex = pattern.regex
-            const text = str(name, primitives, 1)
             if (name === "replaceAll") replaceAllNeedsGlobal(regex)
+            checkReplacementLength(value, text, () => (regex.global ? countMatches(value, regex) : 1))
             return name === "replace" ? value.replace(regex, text) : value.replaceAll(regex, text)
           }
-          if (name === "replace") return value.replace(str(name, primitives, 0), str(name, primitives, 1))
-          return value.replaceAll(str(name, primitives, 0), str(name, primitives, 1))
+          const needle = str(name, primitives, 0)
+          checkReplacementLength(value, text, () => (name === "replace" ? 1 : countOccurrences(value, needle)))
+          return name === "replace" ? value.replace(needle, text) : value.replaceAll(needle, text)
         },
       )
     })
